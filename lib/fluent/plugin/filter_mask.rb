@@ -76,6 +76,7 @@ module Fluent
     end
     config_section :mask, param_name: :mask_config_list, required: true, multi: true do
       config_argument :method, :enum, list: MASK_METHODS.keys
+      config_param :salt, :string, default: nil
 
       config_param :key, :string, default: nil
       config_param :keys, :array, default: []
@@ -101,11 +102,11 @@ module Fluent
       @mask_config_list.each do |c|
         conv = MASK_METHODS[c.method].call(c)
         [c.key || nil, *c.keys].compact.each do |key|
-          @masks << masker_for_key(key)
+          @masks << masker_for_key(key, c.salt)
         end
-        @masks << masker_for_key_pattern(c.key_pattern) if c.key_pattern
-        @masks << masker_for_value_pattern(c.value_pattern) if c.value_pattern
-        @masks << masker_for_value_in_subnet(c.value_in_subnet) if c.value_in_subnet
+        @masks << masker_for_key_pattern(c.key_pattern, c.salt) if c.key_pattern
+        @masks << masker_for_value_pattern(c.value_pattern, c.salt) if c.value_pattern
+        @masks << masker_for_value_in_subnet(c.value_in_subnet, c.salt) if c.value_in_subnet
       end
 
       if @salt_list.empty?
@@ -132,11 +133,11 @@ module Fluent
       @salt_map[key]
     end
 
-    def masker_for_key(key)
+    def masker_for_key(key, salt)
       ->(record){
         begin
           if record.has_key?(key)
-            record[key] = conv.call(record[key], salt_determine(key))
+            record[key] = conv.call(record[key], salt || salt_determine(key))
           end
         rescue => e
           log.error "unexpected error while masking value", error_class: e.class, error: e.message
@@ -145,13 +146,13 @@ module Fluent
       }
     end
 
-    def masker_for_key_pattern(pattern)
+    def masker_for_key_pattern(pattern, salt)
       regexp = Regexp.new(pattern)
       -> (record){
         begin
           record.each_pair do |key, value|
             next unless (regexp =~ key.to_s rescue nil)
-            record[key] = conv.call(value, salt_determine(key))
+            record[key] = conv.call(value, salt || salt_determine(key))
           end
         rescue => e
           log.error "unexpected error while masking value", error_class: e.class, error: e.message
@@ -160,13 +161,13 @@ module Fluent
       }
     end
 
-    def masker_for_value_pattern(pattern)
+    def masker_for_value_pattern(pattern, salt)
       regexp = Regexp.new(pattern)
       -> (record){
         begin
           record.each_pair do |key, value|
             next unless (regexp =~ value.to_s rescue nil)
-            record[key] = conv.call(value, salt_determine(key))
+            record[key] = conv.call(value, salt || salt_determine(key))
           end
         rescue => e
           log.error "unexpected error while masking value", error_class: e.class, error: e.message
@@ -175,13 +176,13 @@ module Fluent
       }
     end
 
-    def masker_for_value_in_subnet(network_str)
+    def masker_for_value_in_subnet(network_str, salt)
       network = IPAddr.new(network_str)
       ->(record){
         begin
           record.each_pair do |key, value|
             next unless (network.include?(value) rescue nil)
-            record[key] = conv.call(value, salt_determine(key))
+            record[key] = conv.call(value, salt || salt_determine(key))
           end
         rescue => e
           log.error "unexpected error while masking value", error_class: e.class, error: e.message
