@@ -88,6 +88,17 @@ module Fluent
       config_param :ipv6_mask_bits, :integer, default: nil
     end
 
+    # obsolete configuration parameters
+    config_param :md5_keys,    :string, default: nil
+    config_param :sha1_keys,   :string, default: nil
+    config_param :sha256_keys, :string, default: nil
+    config_param :sha384_keys, :string, default: nil
+    config_param :sha512_keys, :string, default: nil
+    config_param :hash_salt,   :string, default: nil
+    config_param :ipaddr_mask_keys, :string, default: nil
+    config_param :ipv4_mask_subnet, :integer, default: 24
+    config_param :ipv6_mask_subnet, :integer, default: 104
+
     def initialize
       super
       @salt_list = []
@@ -107,6 +118,24 @@ module Fluent
         @masks << masker_for_key_pattern(c.key_pattern, c.salt) if c.key_pattern
         @masks << masker_for_value_pattern(c.value_pattern, c.salt) if c.value_pattern
         @masks << masker_for_value_in_subnet(c.value_in_subnet, c.salt) if c.value_in_subnet
+      end
+
+      # obsolete option handling
+      [[@md5_keys,"md5"],[@sha1_keys,"sha1"],[@sha256_keys,"sha256"],[@sha384_keys,"sha384"],[@sha512_keys,"sha512"]].each do |param,m|
+        next unless param
+        conv = MASK_METHODS[m].call(OpenStruct.new)
+        param.split(',').map(&:strip).each do |key|
+          @mask << masker_for_key(key, @hash_salt || '')
+        end
+      end
+      if @ipaddr_mask_keys
+        conf = OpenStruct.new
+        conf.ipv4_mask_bits = @ipv4_mask_subnet
+        conf.ipv6_mask_bits = @ipv4_mask_subnet
+        conv = MASK_METHODS["network"].call(conf)
+        @ipaddr_mask_keys.split(',').map(&:strip).each do |key|
+          @mask << masker_for_key(key, @hash_salt || '')
+        end
       end
 
       if @salt_list.empty?
