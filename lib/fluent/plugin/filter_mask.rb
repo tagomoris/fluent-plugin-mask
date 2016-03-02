@@ -1,0 +1,193 @@
+require 'fluent/filter'
+require 'openssl'
+require 'uri'
+
+# <filter **>
+#   @type mask
+#   # salts will be selected for field names in a deterministic way
+#   salt secret_salt # different salt for each fields?
+#   salt salt_brabra
+#   salts s1,s2,s3,s4
+#   <mask sha1>
+#     # key user_id
+#     keys ["user_id","session_id","source_ip"]
+#     key_pattern   ^(source|src)_?ip_?(addr|address)?$
+#     value_pattern   @mydomain\.example\.com$
+#     value_in_subnet 192.168.0.0/16 # naming?
+#   </mask>
+#   <mask uri_path>
+#     keys ["url","uri"]
+#     # or key_pattern
+#   </mask>
+#   <mask network>
+#     keys ["dest","destination","dest_ip"]
+#     # or key_pattern
+#     ipv4_mask_bits 24
+#     ipv6_mask_bits 104
+#   </mask>
+# </filter>
+
+module Fluent
+  class MaskFilter < Filter
+    Fluent::Plugin.register_filter('mask', self)
+
+    MASK_METHODS = ["md5", "sha1", "sha256", "sha384", "sha512", "uri_path", "network"]
+    MASK_METHODS = {
+      "md5"    => ->(opts){ ->(v,salt){ OpenSSL::Digest.new("md5").update(salt).update(v.to_s).hexdigest } },
+      "sha1"   => ->(opts){ ->(v,salt){ OpenSSL::Digest.new("sha1").update(salt).update(v.to_s).hexdigest } },
+      "sha256" => ->(opts){ ->(v,salt){ OpenSSL::Digest.new("sha256").update(salt).update(v.to_s).hexdigest } },
+      "sha384" => ->(opts){ ->(v,salt){ OpenSSL::Digest.new("sha384").update(salt).update(v.to_s).hexdigest } },
+      "sha512" => ->(opts){ ->(v,salt){ OpenSSL::Digest.new("sha512").update(salt).update(v.to_s).hexdigest } },
+      "uri_path" => ->(opts){ ->(v,salt){
+          begin
+            uri = URI.parse(v)
+            if uri.absolute?
+              uri.path = '/'
+              uri.user = uri.password = uri.query = uri.fragment = nil
+            end
+            uri.to_s
+          rescue
+            v
+          end
+        } },
+      "network" => ->(opts){ ->(v,salt){
+          begin
+            addr = IPAddr.new(v)
+            if addr.ipv4? && opts.ipv4_mask_bits
+              addr.mask(opts.ipv4_mask_bits).to_s
+            elsif addr.ipv6? && opts.ipv6_mask_bits
+              addr.mask(opts.ipv6_mask_bits).to_s
+            else
+              addr.to_s
+            end
+          rescue
+            v
+          end
+        } },
+    }
+
+    config_param :salt, default: nil do |value|
+      @salt_list << value.strip.to_s
+    end
+    config_param :salts, default: nil do |values|
+      values.split(',').map(&:strip).each do |value|
+        @salt_list << value
+      end
+    end
+    config_section :mask, param_name: :mask_config_list, required: true, multi: true do
+      config_argument :method, :enum, list: MASK_METHODS.keys
+
+      config_param :key, :string, default: nil
+      config_param :keys, :array, default: []
+      config_param :key_pattern, :string, default: nil
+      config_param :value_pattern, :string, default: nil
+      config_param :value_in_subnet, :string, default: nil # 192.168.0.0/24
+
+      config_param :ipv4_mask_bits, :integer, default: nil
+      config_param :ipv6_mask_bits, :integer, default: nil
+    end
+
+    def initialize
+      super
+      @salt_list = []
+      @salt_map = {}
+      @conversions = []
+    end
+
+    def configure(conf)
+      super
+
+      @masks = []
+      @mask_config_list.each do |c|
+        conv = MASK_METHODS[c.method].call(c)
+        [c.key || nil, *c.keys].compact.each do |key|
+          @masks << masker_for_key(key)
+        end
+        @masks << masker_for_key_pattern(c.key_pattern) if c.key_pattern
+        @masks << masker_for_value_pattern(c.value_pattern) if c.value_pattern
+        @masks << masker_for_value_in_subnet(c.value_in_subnet) if c.value_in_subnet
+      end
+
+      if @salt_list.empty?
+        raise Fluent::ConfigError, "salt (or salts) required, but missing"
+      end
+    end
+
+    def filter_stream(tag, es)
+      new_es = MultiEventStream.new
+      es.each do |time, record|
+        new_es.add(time, @masks.reduce(record){|r,mask| mask.call(r) })
+      end
+      new_es
+    end
+
+    def salt_determine(key)
+      return @salt_map[key] if @salt_map.has_key?(key)
+      keystr = key.to_s
+      if keystr.empty?
+        @salt_map[key] = @salt_list[0]
+      else
+        @salt_map[key] = @salt_list[(keystr[0].ord + keystr[-1].ord) % @salt_map.size]
+      end
+      @salt_map[key]
+    end
+
+    def masker_for_key(key)
+      ->(record){
+        begin
+          if record.has_key?(key)
+            record[key] = conv.call(record[key], salt_determine(key))
+          end
+        rescue => e
+          log.error "unexpected error while masking value", error_class: e.class, error: e.message
+        end
+        record
+      }
+    end
+
+    def masker_for_key_pattern(pattern)
+      regexp = Regexp.new(pattern)
+      -> (record){
+        begin
+          record.each_pair do |key, value|
+            next unless (regexp =~ key.to_s rescue nil)
+            record[key] = conv.call(value, salt_determine(key))
+          end
+        rescue => e
+          log.error "unexpected error while masking value", error_class: e.class, error: e.message
+        end
+        record
+      }
+    end
+
+    def masker_for_value_pattern(pattern)
+      regexp = Regexp.new(pattern)
+      -> (record){
+        begin
+          record.each_pair do |key, value|
+            next unless (regexp =~ value.to_s rescue nil)
+            record[key] = conv.call(value, salt_determine(key))
+          end
+        rescue => e
+          log.error "unexpected error while masking value", error_class: e.class, error: e.message
+        end
+        record
+      }
+    end
+
+    def masker_for_value_in_subnet(network_str)
+      network = IPAddr.new(network_str)
+      ->(record){
+        begin
+          record.each_pair do |key, value|
+            next unless (network.include?(value) rescue nil)
+            record[key] = conv.call(value, salt_determine(key))
+          end
+        rescue => e
+          log.error "unexpected error while masking value", error_class: e.class, error: e.message
+        end
+        record
+      }
+    end
+  end
+end
